@@ -1,240 +1,202 @@
 plugin.onLoad(() => {
-    // 1. 注入独立硬件加速图层与溢出裁切样式
-    const styleEl = document.createElement('style');
-    const hideOverflow = !("MaterialYouTheme" in loadedPlugins) ? "overflow-x: hidden;" : "";
-    styleEl.id = 'fluent-progress-bar-style';
-    styleEl.innerHTML = `
-        .m-player .prg { ${hideOverflow} }
-        .m-player .prg .has {
-            width: 100% !important;
-            transform-origin: left center !important;
-            will-change: transform !important;
-        }
-        .m-player-fm .prg { ${hideOverflow} }
-        .m-player-fm .prg .has {
-            width: 100% !important;
-            transform-origin: left center !important;
-            will-change: transform !important;
-        }
-    `;
-    document.head.appendChild(styleEl);
+    try {
+        // 1. 注入独立硬件加速图层与溢出裁切样式
+        let hasMaterialYou = false;
+        try {
+            hasMaterialYou = (typeof loadedPlugins !== 'undefined' && loadedPlugins && ("MaterialYouTheme" in loadedPlugins));
+        } catch {}
 
-    const ANIM_MAX_LEN = 100000; // 100,000ms 虚拟动画时长，保证亚毫秒级平滑精度
-    const DRIFT_THRESHOLD_SEC = 0.6; // 漂移阈值（秒），正常播放时不干扰合成器，只有手动跳转或切歌时校准
+        const styleEl = document.createElement('style');
+        const hideOverflow = !hasMaterialYou ? "overflow-x: hidden;" : "";
+        styleEl.id = 'fluent-progress-bar-style';
+        styleEl.innerHTML = `
+            .m-player .prg { ${hideOverflow} }
+            .m-player .prg .has {
+                width: 100% !important;
+                transform-origin: left center !important;
+                will-change: transform !important;
+            }
+            .m-player-fm .prg { ${hideOverflow} }
+            .m-player-fm .prg .has {
+                width: 100% !important;
+                transform-origin: left center !important;
+                will-change: transform !important;
+            }
+        `;
+        document.head.appendChild(styleEl);
 
-    let totalDuration = 0;
-    let currentProgress = 0;
-    let isPlaying = false;
+        // 限制最高 60 FPS，杜绝 160Hz 屏幕下高频 D3D11 Present 导致的额外负载
+        const TARGET_FPS = 60;
+        const FRAME_INTERVAL = 1000 / TARGET_FPS;
 
-    const barControllers = new Set();
+        let totalDuration = 0;
+        let lastAudioProgress = 0;
+        let lastAudioTimestamp = 0;
+        let isPlaying = false;
+        let isSeeking = false;
+        let rafId = null;
+        let lastFrameTime = 0;
 
-    class ProgressBarController {
-        constructor(eleHas) {
-            this.eleHas = eleHas;
-            this.elePrg = eleHas.closest('.prg') || eleHas.parentElement;
-            this.isSeeking = false;
-            this.needSyncAfterSeek = false;
+        const trackedBars = new Set();
 
-            this.anim = eleHas.animate(
-                [
-                    { transform: 'translateX(-100%)' },
-                    { transform: 'translateX(0%)' }
-                ],
-                {
-                    duration: ANIM_MAX_LEN,
-                    fill: 'both'
-                }
-            );
-            this.anim.pause();
-
-            this.setupEvents();
-            if (totalDuration > 0) {
-                this.syncRate(totalDuration);
-                this.syncProgress(currentProgress, true);
-                if (isPlaying && !document.hidden) {
-                    this.anim.play();
+        function applyTransform(ratio) {
+            const pct = Math.max(0, Math.min(1, ratio)) * 100;
+            const transStr = `translateX(${-100 + pct}%)`;
+            for (const el of trackedBars) {
+                if (document.contains(el)) {
+                    // 仅对当前可见元素刷新，跳过后台隐藏的进度条容器
+                    if (el.offsetParent !== null) {
+                        el.style.transform = transStr;
+                    }
+                } else {
+                    trackedBars.delete(el);
                 }
             }
         }
 
-        syncRate(duration) {
-            if (!duration || duration <= 0) return;
-            const targetRate = ANIM_MAX_LEN / (duration * 1000);
-            if (Math.abs(this.anim.playbackRate - targetRate) > 1e-7) {
-                this.anim.playbackRate = targetRate;
-            }
-        }
-
-        syncProgress(progress, force = false) {
-            if (!totalDuration || totalDuration <= 0 || this.isSeeking) return;
-
-            const targetTime = (progress / totalDuration) * ANIM_MAX_LEN;
-
-            if (force || this.needSyncAfterSeek) {
-                this.needSyncAfterSeek = false;
-                this.anim.currentTime = targetTime;
+        function renderFrame(now) {
+            if (!isPlaying || isSeeking || document.hidden || totalDuration <= 0) {
+                rafId = null;
                 return;
             }
 
-            // 计算音频底层进度与动画视觉进度的时钟漂移
-            const currentAnimSec = (this.anim.currentTime / ANIM_MAX_LEN) * totalDuration;
-            const drift = Math.abs(progress - currentAnimSec);
+            rafId = requestAnimationFrame(renderFrame);
 
-            // 只有当偏差超过阈值（如手动快进/点击歌词跳转/网络卡顿跳帧）才瞬时校准
-            if (drift > DRIFT_THRESHOLD_SEC) {
-                this.anim.currentTime = targetTime;
+            // 60FPS 节流控制
+            if (now - lastFrameTime < FRAME_INTERVAL) return;
+            lastFrameTime = now - ((now - lastFrameTime) % FRAME_INTERVAL);
+
+            const elapsedSec = (now - lastAudioTimestamp) / 1000;
+            const currentSec = lastAudioProgress + elapsedSec;
+            const ratio = currentSec / totalDuration;
+
+            applyTransform(ratio);
+        }
+
+        function startRender() {
+            if (!rafId && isPlaying && !isSeeking && !document.hidden && totalDuration > 0) {
+                lastFrameTime = performance.now();
+                rafId = requestAnimationFrame(renderFrame);
             }
         }
 
-        play() {
-            if (!this.isSeeking && this.anim.playState !== 'running') {
-                this.anim.play();
+        function stopRender() {
+            if (rafId) {
+                cancelAnimationFrame(rafId);
+                rafId = null;
             }
         }
 
-        pause() {
-            if (this.anim.playState !== 'paused') {
-                this.anim.pause();
+        function registerBar(eleHas) {
+            if (!eleHas || trackedBars.has(eleHas)) return;
+            trackedBars.add(eleHas);
+            eleHas.style.transform = 'translateX(-100%)';
+
+            const elePrg = eleHas.closest('.prg') || eleHas.parentElement;
+            if (elePrg && !elePrg._fpbBound) {
+                elePrg._fpbBound = true;
+
+                let dragging = false;
+                const updateSeek = (e) => {
+                    const rect = elePrg.getBoundingClientRect();
+                    if (rect.width > 0) {
+                        const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+                        applyTransform(ratio);
+                    }
+                };
+
+                const onPointerMove = (e) => {
+                    if (dragging) updateSeek(e);
+                };
+
+                const onPointerUp = () => {
+                    if (dragging) {
+                        dragging = false;
+                        window.removeEventListener('pointermove', onPointerMove);
+                        window.removeEventListener('pointerup', onPointerUp);
+                        window.removeEventListener('pointercancel', onPointerUp);
+
+                        setTimeout(() => {
+                            isSeeking = false;
+                            startRender();
+                        }, 50);
+                    }
+                };
+
+                elePrg.addEventListener('pointerdown', (e) => {
+                    if (e.button !== 0) return;
+                    dragging = true;
+                    isSeeking = true;
+                    stopRender();
+                    updateSeek(e);
+
+                    window.addEventListener('pointermove', onPointerMove);
+                    window.addEventListener('pointerup', onPointerUp);
+                    window.addEventListener('pointercancel', onPointerUp);
+                });
             }
         }
 
-        setupEvents() {
-            if (!this.elePrg) return;
+        legacyNativeCmder.appendRegisterCall('Load', 'audioplayer', (_, info) => {
+            if (info && typeof info.duration === 'number' && info.duration > 0) {
+                totalDuration = info.duration;
+                lastAudioProgress = 0;
+                lastAudioTimestamp = performance.now();
+                applyTransform(0);
+            }
+        });
 
-            const updateFromPointer = (e) => {
-                const rect = this.elePrg.getBoundingClientRect();
-                if (rect.width > 0) {
-                    const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-                    this.anim.currentTime = ratio * ANIM_MAX_LEN;
+        legacyNativeCmder.appendRegisterCall('PlayProgress', 'audioplayer', (_, progress) => {
+            if (typeof progress !== 'number' || progress < 0 || totalDuration <= 0) return;
+            lastAudioProgress = progress;
+            lastAudioTimestamp = performance.now();
+
+            if (!isPlaying) {
+                applyTransform(progress / totalDuration);
+            }
+        });
+
+        legacyNativeCmder.appendRegisterCall('PlayState', 'audioplayer', (_, __, state) => {
+            if (state === 1) {
+                isPlaying = true;
+                lastAudioTimestamp = performance.now();
+                startRender();
+            } else if (state === 2) {
+                isPlaying = false;
+                stopRender();
+            }
+        });
+
+        document.addEventListener('visibilitychange', () => {
+            if (document.hidden) {
+                stopRender();
+            } else {
+                if (isPlaying) {
+                    lastAudioTimestamp = performance.now();
+                    startRender();
                 }
-            };
+            }
+        });
 
-            let dragging = false;
+        // 轮询定位播放器元素
+        let pollCount = 0;
+        const pollTimer = setInterval(() => {
+            pollCount++;
+            const mPlayerHas = document.querySelector('.m-player .prg .has');
+            const mainPlayerHas = document.querySelector('#main-player .prg .has');
+            const anyPrgHas = document.querySelector('.prg .has');
+            const fmPrgHas = document.querySelector('.m-player-fm .prg .has');
 
-            const onPointerMove = (e) => {
-                if (dragging) {
-                    updateFromPointer(e);
-                }
-            };
+            const target = mPlayerHas || mainPlayerHas || anyPrgHas;
+            if (target) registerBar(target);
+            if (fmPrgHas) registerBar(fmPrgHas);
 
-            const onPointerUp = () => {
-                if (dragging) {
-                    dragging = false;
-                    window.removeEventListener('pointermove', onPointerMove);
-                    window.removeEventListener('pointerup', onPointerUp);
-                    window.removeEventListener('pointercancel', onPointerUp);
+            if (pollCount > 30 && trackedBars.size > 0) {
+                clearInterval(pollTimer);
+            }
+        }, 500);
 
-                    this.needSyncAfterSeek = true;
-                    setTimeout(() => {
-                        this.isSeeking = false;
-                        if (isPlaying && !document.hidden) {
-                            this.play();
-                        }
-                    }, 50);
-                }
-            };
-
-            this.elePrg.addEventListener('pointerdown', (e) => {
-                if (e.button !== 0) return;
-                dragging = true;
-                this.isSeeking = true;
-                this.pause();
-                updateFromPointer(e);
-
-                window.addEventListener('pointermove', onPointerMove);
-                window.addEventListener('pointerup', onPointerUp);
-                window.addEventListener('pointercancel', onPointerUp);
-            });
-        }
-
-        destroy() {
-            try {
-                this.anim.cancel();
-            } catch {}
-        }
+    } catch (err) {
+        console.error("[FluentProgressBar] Error:", err);
     }
-
-    function cleanupDetached() {
-        for (const controller of barControllers) {
-            if (!document.contains(controller.eleHas)) {
-                controller.destroy();
-                barControllers.delete(controller);
-            }
-        }
-    }
-
-    function registerProgressBar(eleHas) {
-        if (!eleHas) return;
-        cleanupDetached();
-        for (const c of barControllers) {
-            if (c.eleHas === eleHas) return;
-        }
-        const controller = new ProgressBarController(eleHas);
-        barControllers.add(controller);
-    }
-
-    // 全局单例监听音频播放器底层指令，杜绝重复监听
-    legacyNativeCmder.appendRegisterCall('Load', 'audioplayer', (_, info) => {
-        if (info && typeof info.duration === 'number' && info.duration > 0) {
-            totalDuration = info.duration;
-            currentProgress = 0;
-            cleanupDetached();
-            for (const c of barControllers) {
-                c.syncRate(totalDuration);
-                c.syncProgress(0, true);
-                if (isPlaying && !document.hidden) {
-                    c.play();
-                }
-            }
-        }
-    });
-
-    legacyNativeCmder.appendRegisterCall('PlayProgress', 'audioplayer', (_, progress) => {
-        if (typeof progress !== 'number' || progress < 0 || totalDuration <= 0) return;
-        currentProgress = progress;
-        cleanupDetached();
-        for (const c of barControllers) {
-            c.syncProgress(progress);
-        }
-    });
-
-    legacyNativeCmder.appendRegisterCall('PlayState', 'audioplayer', (_, __, state) => {
-        cleanupDetached();
-        if (state === 1) {
-            // 播放状态
-            isPlaying = true;
-            if (!document.hidden) {
-                for (const c of barControllers) {
-                    c.play();
-                }
-            }
-        } else if (state === 2) {
-            // 暂停状态
-            isPlaying = false;
-            for (const c of barControllers) {
-                c.pause();
-            }
-        }
-    });
-
-    // 窗口最小化/遮挡自适应节能休眠
-    document.addEventListener('visibilitychange', () => {
-        cleanupDetached();
-        if (document.hidden) {
-            for (const c of barControllers) {
-                c.pause();
-            }
-        } else {
-            if (isPlaying && totalDuration > 0) {
-                for (const c of barControllers) {
-                    c.syncProgress(currentProgress, true);
-                    c.play();
-                }
-            }
-        }
-    });
-
-    // 挂载主界面与私人FM进度条
-    betterncm.utils.waitForElement('#main-player .prg .has').then(registerProgressBar);
-    betterncm.utils.waitForElement('.m-player-fm .prg .has').then(registerProgressBar);
 });

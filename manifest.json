@@ -1,13 +1,13 @@
 {
     "manifest_version": 1,
-    "name": "FluentProgressBar",
-    "slug": "FluentProgressBar",
+    "name": "FluentProgressBar (优化版)",
+    "slug": "FluentProgressBar-Optimized",
     "version": "1.0.4",
     "author": "MicroBlock & Solstice23, Indor",
     "author_links": [
         "https://github.com/In-dor/FluentProgessBar"
     ],
-    "description": "让你的进度条更顺滑！(60FPS 节流与极低 CPU 占用优化版)",
+    "description": "让你的进度条更顺滑！(优化版)",
     "preview": "preview.png",
     "type": "extension",
     "fork_of": "FluentProgressBar",

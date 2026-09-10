@@ -205,9 +205,9 @@ plugin.onConfig(() => {
     const el = document.createElement('div');
     el.style.padding = '10px 0';
     el.innerHTML = `
-        <h4 style="margin: 0 0 8px 0; font-weight: bold;">FluentProgressBar (优化版 v1.0.4)</h4>
+        <h4 style="margin: 0 0 8px 0; font-weight: bold;">FluentProgressBar (优化版)</h4>
         <p style="margin: 0 0 12px 0; color: #888; font-size: 13px;">
-            针对高刷/4K 显示器深度优化的平滑进度条。基于 RAF 节流插值与零 DOM 监听，杜绝死循环与高 CPU 占用。
+            让你的进度条更顺滑！(优化版)
         </p>
         <div style="display: flex; gap: 10px;">
             <button id="fpb-open-repo" class="u-ibtn5 u-ibtnsz8">源码仓库 (GitHub)</button>
